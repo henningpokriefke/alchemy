@@ -14,6 +14,7 @@ import { CloudflareAuth } from "../Auth/AuthProvider.ts";
 import * as Credentials from "../Credentials.ts";
 import * as RpcServerEnvironment from "../../Local/RpcServerEnvironment.ts";
 import { PlatformServices, runMain } from "../../Util/PlatformServices.ts";
+import * as CliKit from "../../Cli/CliKit/index.ts";
 import { materializeRuntimeBindings } from "./RuntimeBindings.ts";
 import { loadSource, SourceProviderError } from "./Source.ts";
 import * as Vite from "./Sources/Vite.ts";
@@ -150,6 +151,7 @@ const program = Effect.scoped(
 runMain(
   program.pipe(
     Effect.provide(RpcServerEnvironment.fromEnv()),
+    Effect.provide(CliKit.layer({ input: false })),
     Effect.provide(PlatformServices),
   ),
 );
