@@ -1,3 +1,9 @@
+export {};
+
+// Example tests must only use credentials injected by the test environment.
+// Auth providers refuse to consult stored profiles while CI is enabled.
+process.env.CI = "true";
+
 const examples = [
   "./examples/cloudflare-dev",
   "./examples/cloudflare-worker",
@@ -179,12 +185,10 @@ const run = async (
 const runParallel = async (
   tasks: readonly { label: string; command: readonly string[] }[],
 ): Promise<readonly CommandResult[]> => {
-  const states = tasks.map(
-    (task): TaskState => ({
-      ...task,
-      status: "pending",
-    }),
-  );
+  const states = tasks.map((task): TaskState => ({
+    ...task,
+    status: "pending",
+  }));
   const renderer = makeStatusRenderer(states);
   renderer.render();
   const interval = setInterval(() => renderer.render(), 1000);
@@ -230,6 +234,25 @@ if (failedTests.length > 0) {
     } else {
       console.error("(empty)");
     }
+  }
+  process.exit(1);
+}
+
+const cliResults = await runParallel(
+  examples.map((example) => ({
+    label: `${example} CLI lifecycle`,
+    command: ["bun", "scripts/test-example-cli.ts", example],
+  })),
+);
+const failedCliTests = cliResults.filter((result) => result.exitCode !== 0);
+
+if (failedCliTests.length > 0) {
+  console.error("\nFailed example CLI lifecycle tests:");
+  for (const failure of failedCliTests) {
+    const exit = failure.exitCode === null ? "signal" : failure.exitCode;
+    console.error(`- ${failure.label} (exit ${exit})`);
+    if (failure.stdout.length > 0) console.error(failure.stdout.trimEnd());
+    if (failure.stderr.length > 0) console.error(failure.stderr.trimEnd());
   }
   process.exit(1);
 }

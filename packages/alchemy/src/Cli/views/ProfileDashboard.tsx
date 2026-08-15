@@ -120,7 +120,6 @@ interface DashState {
  * timer live outside the snapshot — they carry no visual state.
  */
 class DashStore extends LiveStore<DashState> {
-  private noticeTimer: ReturnType<typeof setTimeout> | undefined;
   private resolver: ((action: PureAction | ExternalAction) => void) | null =
     null;
 
@@ -154,18 +153,12 @@ class DashStore extends LiveStore<DashState> {
     this.update((state) => ({ ...state, focus: undefined }));
   }
   dispose() {
-    clearTimeout(this.noticeTimer);
     this.resolver = null;
   }
+  clearNotice() {
+    this.update((state) => ({ ...state, notice: undefined }));
+  }
   applyResult(result: ExecuteResult) {
-    // toast: success notices dismiss themselves after a beat; error notices
-    // persist until the next action so a failure can't vanish unread.
-    clearTimeout(this.noticeTimer);
-    if (result.ok) {
-      this.noticeTimer = setTimeout(() => {
-        this.update((state) => ({ ...state, notice: undefined }));
-      }, 4000);
-    }
     this.update((state) => ({
       ...state,
       entries: result.entries,
@@ -181,7 +174,6 @@ class DashStore extends LiveStore<DashState> {
     if (this.snapshot().busy || this.resolver === null) return;
     const resolve = this.resolver;
     this.resolver = null;
-    clearTimeout(this.noticeTimer);
     this.update((state) => ({ ...state, busy: true, notice: undefined }));
     resolve(action);
   };
@@ -189,7 +181,9 @@ class DashStore extends LiveStore<DashState> {
 
 // --- building blocks --------------------------------------------------------
 
-const DetailsPane = ({ details }: { details: Details }): JSX.Element => {
+type DetailsPaneProps = { details: Details };
+
+function DetailsPane({ details }: DetailsPaneProps): JSX.Element {
   if (details.state === "loading") {
     return <Spinner label="resolving credentials…" />;
   }
@@ -209,7 +203,7 @@ const DetailsPane = ({ details }: { details: Details }): JSX.Element => {
       reauthHint="press r to re-login"
     />
   );
-};
+}
 
 // --- edit screen ------------------------------------------------------------
 
@@ -219,17 +213,19 @@ interface EditRow {
   readonly states: ReadonlyArray<EditState>;
 }
 
-const EditScreen = ({
-  profile,
-  rows,
-  onApply,
-  onBack,
-}: {
+type EditScreenProps = {
   profile: string;
   rows: ReadonlyArray<EditRow>;
   onApply: (choices: ReadonlyArray<EditState>) => void;
   onBack: () => void;
-}): JSX.Element => {
+};
+
+function EditScreen({
+  profile,
+  rows,
+  onApply,
+  onBack,
+}: EditScreenProps): JSX.Element {
   const { cursor, indices, move, cycle } = useCycleNavigation(
     rows.map((row) => row.states.length),
   );
@@ -300,19 +296,84 @@ const EditScreen = ({
       />
     </Stack>
   );
-};
+}
 
 // --- main component ---------------------------------------------------------
 
 type Mode = "normal" | "rename" | "create" | "delete";
 
-const Dashboard = ({
+type DashboardControlsProps = {
+  readonly mode: Mode;
+  readonly busy: boolean;
+  readonly flow: Flow | undefined;
+  readonly entry: DashboardEntry | undefined;
+  readonly keybinds: ReadonlyArray<readonly [string, string]>;
+  readonly keyGlyphs: ReturnType<typeof useKeyGlyphs>;
+  readonly store: DashStore;
+  readonly setMode: (mode: Mode) => void;
+};
+
+function DashboardControls({
+  mode,
+  busy,
+  flow,
+  entry,
+  keybinds,
+  keyGlyphs,
   store,
-  initialSelected,
-}: {
+  setMode,
+}: DashboardControlsProps) {
+  if (busy || flow !== undefined) return null;
+  if (mode === "normal") return <KeyBar keys={keybinds} />;
+  if (mode === "delete" && entry !== undefined) {
+    return (
+      <InlineConfirm
+        message={`Delete '${entry.name}' and all its stored credentials?`}
+        onSubmit={(confirmed) => {
+          setMode("normal");
+          if (confirmed) store.dispatch({ kind: "delete", name: entry.name });
+        }}
+        onCancel={() => setMode("normal")}
+      />
+    );
+  }
+
+  const renaming = mode === "rename" && entry !== undefined;
+  return (
+    <Stack>
+      <Text>
+        <Text bold color={theme.color.accent}>
+          {renaming ? `rename '${entry.name}' to` : "new profile name"}
+        </Text>{" "}
+        <Text tone="muted">({keyGlyphs.escape} to cancel)</Text>
+      </Text>
+      <Box paddingLeft={2}>
+        <TextField
+          key={`${mode}-${entry?.name ?? ""}`}
+          placeholder={renaming ? `${entry.name}-new` : "my-profile"}
+          onSubmit={(value) => {
+            const name = value.trim();
+            if (name.length === 0) return;
+            setMode("normal");
+            store.dispatch(
+              renaming
+                ? { kind: "rename", name: entry.name, newName: name }
+                : { kind: "create", name },
+            );
+          }}
+          onCancel={() => setMode("normal")}
+        />
+      </Box>
+    </Stack>
+  );
+}
+
+type DashboardProps = {
   store: DashStore;
   initialSelected: number;
-}): JSX.Element => {
+};
+
+function Dashboard({ store, initialSelected }: DashboardProps): JSX.Element {
   const state = useLiveStore(store);
   const keyGlyphs = useKeyGlyphs();
   const [selected, setSelected] = useState(initialSelected);
@@ -499,55 +560,20 @@ const Dashboard = ({
         ) : null}
       </Box>
       <Stack>
-        {mode === "normal" && !busy && flow === undefined ? (
-          <KeyBar keys={keybinds} />
-        ) : mode === "delete" && entry !== undefined ? (
-          <InlineConfirm
-            message={`Delete '${entry.name}' and all its stored credentials?`}
-            onSubmit={(confirmed) => {
-              setMode("normal");
-              if (confirmed)
-                store.dispatch({ kind: "delete", name: entry.name });
-            }}
-            onCancel={() => setMode("normal")}
-          />
-        ) : (
-          <Stack>
-            <Text>
-              <Text bold color={theme.color.accent}>
-                {mode === "rename" && entry !== undefined
-                  ? `rename '${entry.name}' to`
-                  : "new profile name"}
-              </Text>{" "}
-              <Text tone="muted">({keyGlyphs.escape} to cancel)</Text>
-            </Text>
-            <Box paddingLeft={2}>
-              <TextField
-                key={`${mode}-${entry?.name ?? ""}`}
-                placeholder={
-                  mode === "rename" && entry !== undefined
-                    ? `${entry.name}-new`
-                    : "my-profile"
-                }
-                onSubmit={(value) => {
-                  const name = value.trim();
-                  if (name.length === 0) return;
-                  setMode("normal");
-                  store.dispatch(
-                    mode === "rename" && entry !== undefined
-                      ? { kind: "rename", name: entry.name, newName: name }
-                      : { kind: "create", name },
-                  );
-                }}
-                onCancel={() => setMode("normal")}
-              />
-            </Box>
-          </Stack>
-        )}
+        <DashboardControls
+          mode={mode}
+          busy={busy}
+          flow={flow}
+          entry={entry}
+          keybinds={keybinds}
+          keyGlyphs={keyGlyphs}
+          store={store}
+          setMode={setMode}
+        />
       </Stack>
     </Stack>
   );
-};
+}
 
 // --- session driver ---------------------------------------------------------
 
@@ -593,6 +619,18 @@ export const runProfileDashboardSession = <R,>(
       Effect.scoped(
         Effect.gen(function* () {
           const store = new DashStore(options.entries);
+          let noticeFiber: Fiber.Fiber<void, never> | undefined;
+
+          const applyResult = Effect.fn(function* (result: ExecuteResult) {
+            if (noticeFiber !== undefined) yield* Fiber.interrupt(noticeFiber);
+            store.applyResult(result);
+            if (result.ok) {
+              noticeFiber = yield* Effect.sleep("4 seconds").pipe(
+                Effect.andThen(Effect.sync(() => store.clearNotice())),
+                Effect.forkChild,
+              );
+            }
+          });
 
           const loadInto = (name: string) =>
             options.loadDetails(name).pipe(
@@ -660,7 +698,7 @@ export const runProfileDashboardSession = <R,>(
                   store.setDetails(action.name, { state: "loading" });
                   yield* loadInto(action.name).pipe(Effect.forkChild);
                   store.setFlow(undefined);
-                  store.applyResult({
+                  yield* applyResult({
                     ok: result.ok,
                     message: result.message,
                     entries,
@@ -672,7 +710,7 @@ export const runProfileDashboardSession = <R,>(
                   const result = yield* options.execute(action);
                   // a renamed/created profile needs its details (re)resolved
                   const names = store.detailNames();
-                  store.applyResult(result);
+                  yield* applyResult(result);
                   yield* Effect.forEach(
                     result.entries.filter((e) => !names.has(e.name)),
                     (e) => loadInto(e.name),
@@ -683,6 +721,13 @@ export const runProfileDashboardSession = <R,>(
             }
           }).pipe(
             Effect.ensuring(Effect.sync(() => store.dispose())),
+            Effect.ensuring(
+              Effect.suspend(() =>
+                noticeFiber === undefined
+                  ? Effect.void
+                  : Fiber.interrupt(noticeFiber),
+              ),
+            ),
             Effect.ensuring(live.close),
             Effect.ensuring(Fiber.interrupt(loader)),
           );

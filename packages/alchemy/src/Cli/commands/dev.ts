@@ -7,20 +7,31 @@ import { fileURLToPath } from "node:url";
 import { transformTypesFlags } from "../../Util/Node.ts";
 import { SPAWNER_URL_ENV_KEY } from "../../Local/RpcProviderProxy.ts";
 import * as RpcSpawner from "../../Local/RpcSpawner.ts";
-import { envFile, force, profile, script, stage } from "./_shared.ts";
+import {
+  config,
+  envFile,
+  force,
+  profile,
+  stage,
+  suppressInterruptMessages,
+} from "./_shared.ts";
 import { ExecStackOptions } from "./deploy.ts";
 
 export const devCommand = Command.make(
   "dev",
   {
     force,
-    main: script,
+    main: config,
     envFile,
     stage,
     profile,
   },
   Effect.fn(
     function* (args) {
+      // This process is only the exec child's supervisor; the child owns the
+      // terminal and announces the Ctrl+C shutdown. Without this, a SIGINT
+      // hits both processes and the interrupt message prints twice.
+      yield* suppressInterruptMessages;
       const options = yield* Schema.encodeEffect(ExecStackOptions)({
         ...args,
         yes: true,
@@ -68,4 +79,4 @@ export const devCommand = Command.make(
         }),
       )(effect),
   ),
-);
+).pipe(Command.withDescription("Develop a stack with live reload"));

@@ -1,4 +1,5 @@
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Console from "effect/Console";
@@ -11,7 +12,6 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as S from "effect/Schema";
-import * as Argument from "effect/unstable/cli/Argument";
 import * as CliError from "effect/unstable/cli/CliError";
 import * as Flag from "effect/unstable/cli/Flag";
 import { pathToFileURL } from "node:url";
@@ -72,10 +72,7 @@ export const isPromptCancellation = (e: unknown): boolean => {
     if (cur instanceof TerminalCancelled) return true;
     if (
       typeof cur === "object" &&
-      // "PromptCancelled" is the legacy Clack (Util/Clank.ts) cancellation;
-      // it goes away once every command has migrated to CliKit prompts.
-      ((cur as { _tag?: unknown })._tag === "TerminalCancelled" ||
-        (cur as { _tag?: unknown })._tag === "PromptCancelled")
+      (cur as { _tag?: unknown })._tag === "TerminalCancelled"
     ) {
       return true;
     }
@@ -103,8 +100,21 @@ export const EXIT_CANCELLED = 130;
  * Any message has already been rendered by the prompt UI; the non-zero
  * exit code is what lets a script tell "declined" apart from "applied".
  */
-export const exitDeclined = Effect.sync(() => {
-  process.exitCode = 1;
+export const setExitCode = (code: number) =>
+  Effect.sync(() => {
+    process.exitCode = code;
+  });
+
+export const exitDeclined = setExitCode(1);
+
+/**
+ * During `alchemy dev` the outer command is only a supervisor — the exec
+ * child owns the terminal and reports the shutdown. Without suppression a
+ * Ctrl+C hits both processes and the user sees the interrupt message twice.
+ */
+let interruptMessagesSuppressed = false;
+export const suppressInterruptMessages = Effect.sync(() => {
+  interruptMessagesSuppressed = true;
 });
 
 /**
@@ -127,24 +137,21 @@ export const handleCancellation = <A, E, R>(self: Effect.Effect<A, E, R>) =>
             colorsEnabled()
               ? `\n${ANSI_DIM}Cancelled.${ANSI_RESET}`
               : "\nCancelled.",
-          ).pipe(
-            Effect.andThen(
-              Effect.sync(() => {
-                process.exitCode = EXIT_CANCELLED;
-              }),
-            ),
-          )
+          ).pipe(Effect.andThen(setExitCode(EXIT_CANCELLED)))
         : (Effect.failCause(cause) as Effect.Effect<never, E, never>);
     }),
-    // A bare fiber interrupt (Ctrl+C while not inside a prompt) shouldn't
-    // dump a stack trace either; the runtime teardown reports interrupt-only
-    // causes as EXIT_CANCELLED on its own.
+    // A bare fiber interrupt shouldn't dump a stack trace either; the
+    // runtime teardown reports interrupt-only causes as EXIT_CANCELLED on
+    // its own. A SIGINT already announced "Shutting down…" above, so only
+    // interrupts from other sources still print here.
     Effect.onInterrupt(() =>
-      Console.log(
-        colorsEnabled()
-          ? `\n${ANSI_DIM}Interrupted.${ANSI_RESET}`
-          : "\nInterrupted.",
-      ),
+      interruptMessagesSuppressed
+        ? Effect.void
+        : Console.log(
+            colorsEnabled()
+              ? `\n${ANSI_DIM}Interrupted.${ANSI_RESET}`
+              : "\nInterrupted.",
+          ),
     ),
   );
 
@@ -233,12 +240,7 @@ export const handleCliErrors = <A, E, R>(self: Effect.Effect<A, E, R>) =>
  * exit 0, indistinguishable from success.
  */
 export const failWithHelp = (commandPath: ReadonlyArray<string>) =>
-  Effect.sync(() => {
-    // The runtime teardown prefers a non-zero `process.exitCode` when the
-    // effect's own exit code is 0 (which is what an errorless ShowHelp
-    // reports).
-    process.exitCode = 1;
-  }).pipe(
+  setExitCode(1).pipe(
     Effect.andThen(
       Effect.fail(
         new CliError.ShowHelp({ commandPath: [...commandPath], errors: [] }),
@@ -297,38 +299,6 @@ export const force = Flag.boolean("force").pipe(
   Flag.withDefault(false),
 );
 
-export const dryRun = Flag.boolean("dry-run").pipe(
-  Flag.withDescription("Dry run the deployment, do not actually deploy"),
-  Flag.withDefault(false),
-);
-
-export const script = Argument.file("main", {
-  mustExist: true,
-}).pipe(
-  Argument.withDescription("Main file to deploy, defaults to alchemy.run.ts"),
-  Argument.withDefault("alchemy.run.ts"),
-);
-
-export const resourceFilter = Flag.string("filter").pipe(
-  Flag.withDescription(
-    "Comma-separated logical resource IDs (e.g. Api,Sandbox). Only those resources are included.",
-  ),
-  Flag.optional,
-  Flag.map(Option.getOrUndefined),
-);
-
-export const parseResourceFilter = (
-  filter: string | undefined,
-): ReadonlySet<string> | undefined => {
-  if (filter === undefined) return undefined;
-  const ids = filter
-    .split(",")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (ids.length === 0) return undefined;
-  return new Set(ids);
-};
-
 export const config = Flag.file("config", { mustExist: true }).pipe(
   Flag.withDescription("Alchemy entrypoint file (default: alchemy.run.ts)"),
   Flag.withAlias("c"),
@@ -358,7 +328,6 @@ export const TAIL_COLORS = [
   ansiFg(theme.color.accentMuted), // sage
   ansiFg(theme.color.success), // moss
 ];
-export const TAIL_RESET = ANSI_RESET;
 
 export const formatLocalTimestamp = (date: Date): string => {
   const y = date.getFullYear();
@@ -375,29 +344,37 @@ export const formatLocalTimestamp = (date: Date): string => {
   return `${y}-${mo}-${d} ${h}:${mi}:${s}.${ms} ${tz}`;
 };
 
-export const parseSince = (value: string): Date => {
-  const match = value.match(/^(\d+)([smhd])$/);
-  if (match) {
-    const num = parseInt(match[1]!, 10);
-    const unit = match[2]!;
-    const ms =
-      unit === "s"
-        ? num * 1000
-        : unit === "m"
-          ? num * 60_000
-          : unit === "h"
-            ? num * 3_600_000
-            : num * 86_400_000;
-    return new Date(Date.now() - ms);
-  }
-  const parsed = new Date(value);
-  if (isNaN(parsed.getTime())) {
-    throw new UserInputError({
-      message: `Invalid --since value: '${value}'. Use a duration (e.g. '1h', '30m') or ISO date.`,
-    });
-  }
-  return parsed;
-};
+export const parseSince = (value: string) =>
+  Effect.gen(function* () {
+    const match = value.match(/^(\d+)([smhd])$/);
+    if (match) {
+      const amount = match[1];
+      const unit = match[2];
+      if (amount === undefined || unit === undefined) {
+        return yield* new UserInputError({
+          message: `Invalid --since value: '${value}'.`,
+        });
+      }
+      const num = parseInt(amount, 10);
+      const ms =
+        unit === "s"
+          ? num * 1000
+          : unit === "m"
+            ? num * 60_000
+            : unit === "h"
+              ? num * 3_600_000
+              : num * 86_400_000;
+      const now = yield* Clock.currentTimeMillis;
+      return new Date(now - ms);
+    }
+    const parsed = new Date(value);
+    if (isNaN(parsed.getTime())) {
+      return yield* new UserInputError({
+        message: `Invalid --since value: '${value}'. Use a duration (e.g. '1h', '30m') or ISO date.`,
+      });
+    }
+    return parsed;
+  });
 
 /**
  * Wraps a CLI command handler with a top-level OpenTelemetry span
@@ -623,8 +600,7 @@ export interface BuildStackProvidersOptions {
   /** Stack entrypoint to import (e.g. `"alchemy.run.ts"`). */
   main: string;
   envFile: Option.Option<string>;
-  /** `--profile` override; `undefined` falls through to the stored default. */
-  profile: string | undefined;
+  profile: string;
   /**
    * Registry to populate. Pass a pre-seeded registry (e.g. one that already
    * has built-in providers) to layer the stack's providers on top of it,

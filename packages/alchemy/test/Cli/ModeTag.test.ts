@@ -14,6 +14,7 @@
  */
 import { formatModeNote, modeLabel } from "@/Cli/ModeTag.ts";
 import { formatPlanLines } from "@/Cli/LoggingCli.ts";
+import { buildProgressRows } from "@/Cli/views/PlanProgress.tsx";
 import type { CRUD, Plan } from "@/Plan.ts";
 import type { ProviderMode } from "@/ProviderMode.ts";
 import { describe, expect, test } from "alchemy-test";
@@ -151,6 +152,36 @@ describe("formatPlanLines rename tags", () => {
       }),
     );
     expect(lineFor(lines, "Assets")).toContain("(renamed from Bucket)");
+  });
+});
+
+describe("compact plan output", () => {
+  test("shows unchanged resources in plans and in progress", () => {
+    const plan = makePlan({
+      defaultMode: "live",
+      resources: {
+        Stable: crud({ id: "Stable", action: "noop", mode: "live" }),
+        Changed: crud({ id: "Changed", action: "update", mode: "live" }),
+      },
+    });
+
+    const lines = formatPlanLines(plan);
+    expect(lineFor(lines, "Stable")).toContain("noop");
+    expect(lineFor(lines, "Changed")).toContain("update");
+    expect(lines).not.toContain("1 unchanged hidden");
+    // The progress view renders every resource — unchanged rows appear as
+    // noop ("no change") so the whole stack is visibly accounted for.
+    const rows = buildProgressRows(plan);
+    const stable = rows.find(
+      (row) => row.type === "resource" && row.id === "Stable",
+    );
+    expect(stable).toBeDefined();
+    if (stable?.type === "resource") {
+      expect(stable.action).toBe("noop");
+    }
+    expect(
+      rows.some((row) => row.type === "resource" && row.id === "Changed"),
+    ).toBe(true);
   });
 });
 
