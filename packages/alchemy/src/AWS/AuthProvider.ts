@@ -27,6 +27,7 @@ import {
   type ConfigureField,
   type ConfigureMethod,
   type ProviderDetailLine,
+  type ProviderDetails,
 } from "../Auth/AuthProvider.ts";
 import { CredentialsStore, displayRedacted } from "../Auth/Credentials.ts";
 import {
@@ -638,6 +639,22 @@ export const AwsAuth = AuthProviderLayer<
 
     const details = (profileName: string, config: AwsAuthConfig) =>
       Effect.gen(function* () {
+        // Profile display is observational. Resolving local credentials calls
+        // ensureFloci(), which may inspect/start Docker and wait for health;
+        // doing that just to render the dashboard freezes the spinner and
+        // gives a read-only command surprising side effects.
+        if (config.method === "local") {
+          return {
+            lines: [
+              {
+                key: "endpoint",
+                value: config.endpoint ?? DEFAULT_LOCAL_ENDPOINT,
+              },
+              { key: "region", value: config.region ?? "us-east-1" },
+              { key: "source", value: "local" },
+            ],
+          } satisfies ProviderDetails;
+        }
         const creds = yield* resolveCredentials(profileName, config);
         // Resolve the live credentials. An expired/invalid SSO token only
         // surfaces here (the inner effect is lazy), so convert those tags

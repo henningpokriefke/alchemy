@@ -1,11 +1,16 @@
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 
 import { defaultProfileName, ProfileStore } from "../../../Auth/Profile.ts";
 import * as CliKit from "../../../Cli/CliKit/index.ts";
 import { resolveProfileName } from "../../../Cli/ProfileSelection.ts";
 
-import { isPromptCancellation, resolveProfileDisplay } from "../_shared.ts";
+import {
+  importStack,
+  isPromptCancellation,
+  resolveProfileDisplay,
+} from "../_shared.ts";
 import {
   applyRename,
   collectAuthProviders,
@@ -29,6 +34,17 @@ export const profileHub = Effect.fn(function* (options: {
 }) {
   const { envFile, main } = options;
   const profiles = yield* ProfileStore;
+
+  // Import/evaluate user code before Ink mounts. A dynamic import may perform
+  // synchronous module compilation and top-level evaluation, during which no
+  // animation in this JavaScript isolate can advance. collectAuthProviders
+  // imports the same URL later, but that is then an immediate module-cache hit.
+  // Preserve the profile command's built-ins-from-any-directory behavior when
+  // the conventional entrypoint is absent.
+  const fs = yield* FileSystem.FileSystem;
+  if (main !== "alchemy.run.ts" || (yield* fs.exists(main))) {
+    yield* importStack(main);
+  }
 
   // Alphabetical — matches the tab order.
   const computeEntries = Effect.gen(function* () {

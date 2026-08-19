@@ -15,6 +15,7 @@
  */
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Scheduler from "effect/Scheduler";
 import { type JSX, useEffect, useState } from "react";
 import {
   Alert,
@@ -608,13 +609,11 @@ export const runProfileDashboardSession = <R,>(
                   }),
                 ),
               ),
+              // Provider discovery can build very large Layers. Yield often
+              // enough for Ink's 80ms animation clock to keep painting while
+              // that CPU-heavy Effect graph is evaluated.
+              Effect.provideService(Scheduler.MaxOpsBeforeYield, 64),
             );
-
-          const loader = yield* Effect.forEach(
-            options.entries,
-            (entry) => loadInto(entry.name),
-            { concurrency: 2, discard: true },
-          ).pipe(Effect.forkChild);
 
           const initialSelected = Math.max(
             0,
@@ -627,6 +626,15 @@ export const runProfileDashboardSession = <R,>(
             <Dashboard store={store} initialSelected={initialSelected} />,
             { placement: "beforeTranscript" },
           );
+
+          // Mount the spinner before starting stack import/provider builds.
+          // Forking the loader first allowed synchronous module evaluation to
+          // delay the dashboard's first frame, making it look fully hung.
+          const loader = yield* Effect.forEach(
+            options.entries,
+            (entry) => loadInto(entry.name),
+            { concurrency: 2, discard: true },
+          ).pipe(Effect.delay("1 millis"), Effect.forkChild);
 
           yield* Effect.gen(function* () {
             while (true) {

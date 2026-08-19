@@ -1,6 +1,7 @@
 import * as Cause from "effect/Cause";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
+import * as Duration from "effect/Duration";
 import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Result from "effect/Result";
@@ -85,6 +86,12 @@ export const collectAuthProviders = Effect.fn("collectAuthProviders")(
     }
     if (!isMissingDefaultEntrypoint) {
       yield* buildStackProviders({ ...options, registry: authProviders }).pipe(
+        // Registration layers are user code and may start helpers such as a
+        // local Floci container. Keep the built-ins and anything registered
+        // before the deadline instead of making profile management
+        // unreachable forever.
+        Effect.timeout(Duration.seconds(15)),
+        Effect.catchTag("TimeoutError", () => Effect.void),
         Effect.catchCause((cause) => {
           // A registry-only build reaching an unconfigured provider is
           // expected (the profile simply doesn't have that account yet) —
@@ -459,19 +466,23 @@ export const editProfileFlow = Effect.fn(function* (options: {
   });
 
   const removeProvider = Effect.fn(function* (selectedProvider: string) {
-    const authProvider = yield* requireAuthProvider(selectedProvider);
+    const authProvider = authProviders[selectedProvider];
     // Both entry paths guarantee the provider is connected: direct mode
     // validates the plan up front, and the interactive menu only offers
     // delete on connected rows. An entry that no longer decodes is dropped
     // without provider logout — removal must not require valid config.
     const cfg = yield* authProvider
-      .decodeConfig(selectedProfile, stored.providers[selectedProvider]!)
+      ?.decodeConfig(selectedProfile, stored.providers[selectedProvider]!)
       .pipe(Effect.option);
-    if (Option.isSome(cfg)) {
-      yield* authProvider.logout(selectedProfile, cfg.value);
-    } else {
+    if (cfg !== undefined && Option.isSome(cfg)) {
+      yield* authProvider!.logout(selectedProfile, cfg.value);
+    } else if (authProvider !== undefined) {
       yield* CliKit.accessors.output.info(
         `'${selectedProvider}' had an invalid stored entry; dropping it without provider logout.`,
+      );
+    } else {
+      yield* CliKit.accessors.output.info(
+        `'${selectedProvider}' is unavailable; dropping its stored entry without provider logout.`,
       );
     }
     const { [selectedProvider]: _removed, ...remaining } = stored.providers;

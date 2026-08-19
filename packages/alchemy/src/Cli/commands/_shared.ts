@@ -3,6 +3,7 @@ import * as Config from "effect/Config";
 import * as ConfigProvider from "effect/ConfigProvider";
 import * as Console from "effect/Console";
 import * as Data from "effect/Data";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -452,6 +453,7 @@ export const resolveProfileDisplay = Effect.fn(function* (
   stored: Profile["providers"],
   registry: AuthProviders["Service"],
 ) {
+  const detailsTimeout = Duration.seconds(15);
   const renderProvider = (name: string) =>
     Effect.gen(function* () {
       const cfg = stored[name]!;
@@ -478,6 +480,11 @@ export const resolveProfileDisplay = Effect.fn(function* (
         .decodeConfig(profile, cfg)
         .pipe(Effect.flatMap((decoded) => provider.details(profile, decoded)))
         .pipe(
+          // Credential helpers may invoke an external process or local
+          // container. A broken helper must not hold the whole profile UI
+          // hostage: resolving each provider independently also leaves the
+          // edit/remove path available for the bad entry.
+          Effect.timeout(detailsTimeout),
           Effect.map((details) => ({
             name,
             method: cfg.method,
@@ -501,7 +508,14 @@ export const resolveProfileDisplay = Effect.fn(function* (
           Effect.catchCause((cause) => {
             const error = Cause.squash(cause);
             const message =
-              error instanceof Error ? error.message : String(error);
+              typeof error === "object" &&
+              error !== null &&
+              "_tag" in error &&
+              error._tag === "TimeoutError"
+                ? "Timed out after 15 seconds. Reconfigure or remove this provider."
+                : error instanceof Error
+                  ? error.message
+                  : String(error);
             return Effect.succeed({
               name,
               method: cfg.method,
