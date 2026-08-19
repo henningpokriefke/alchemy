@@ -12,6 +12,7 @@ import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as S from "effect/Schema";
+import * as Argument from "effect/unstable/cli/Argument";
 import * as CliError from "effect/unstable/cli/CliError";
 import * as Flag from "effect/unstable/cli/Flag";
 import { pathToFileURL } from "node:url";
@@ -286,6 +287,11 @@ export const envFile = Flag.file("env-file").pipe(
   ),
 );
 
+export const dryRun = Flag.boolean("dry-run").pipe(
+  Flag.withDescription("Dry run the deployment, do not actually deploy"),
+  Flag.withDefault(false),
+);
+
 export const yes = Flag.boolean("yes").pipe(
   Flag.withAlias("y"),
   Flag.withDescription("Yes to all prompts"),
@@ -303,6 +309,11 @@ export const config = Flag.file("config", { mustExist: true }).pipe(
   Flag.withDescription("Alchemy entrypoint file (default: alchemy.run.ts)"),
   Flag.withAlias("c"),
   Flag.withDefault("alchemy.run.ts"),
+);
+
+export const script = Argument.file("main", { mustExist: true }).pipe(
+  Argument.withDescription("Main file to deploy, defaults to alchemy.run.ts"),
+  Argument.withDefault("alchemy.run.ts"),
 );
 
 export const profile = Flag.string("profile").pipe(

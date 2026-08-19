@@ -19,19 +19,66 @@ import packageJson from "../../package.json" with { type: "json" };
 import * as CliKit from "./CliKit/index.ts";
 import { checkLatestVersion } from "./checkVersion.ts";
 import { handleCliErrors } from "./commands/_shared.ts";
-import {
-  deployCommand,
-  destroyCommand,
-  planCommand,
-} from "./commands/deploy.ts";
-import { devCommand } from "./commands/dev.ts";
-import { logsCommand } from "./commands/logs.ts";
-import { unsafeCommand } from "./commands/nuke.ts";
-import { profileCommand } from "./commands/profile/index.ts";
-import { providerCommand } from "./commands/provider.ts";
-import { stateCommand } from "./commands/state.ts";
-import { driftCommand } from "./commands/drift.ts";
 import { selectCliServices } from "./selectCli.ts";
+
+const commandMetadata = [
+  ["provider", "Manage cloud provider prerequisites and utilities"],
+  ["deploy", "Deploy a stack"],
+  ["dev", "Develop a stack with live reload"],
+  ["destroy", "Destroy a deployed stack"],
+  ["plan", "Preview changes to a stack"],
+  ["logs", "Fetch or follow logs from stack resources"],
+  ["profile", "Manage authentication profiles and accounts"],
+  ["state", "Inspect and manage deployment state"],
+  ["drift", "Detect infrastructure drift"],
+  ["unsafe", "Unsafe maintenance commands"],
+] as const;
+
+type CommandName = (typeof commandMetadata)[number][0];
+
+const placeholderCommand = (name: CommandName, description: string) =>
+  Command.make(name, {}, () => Effect.void).pipe(
+    Command.withDescription(description),
+    name === "unsafe" ? Command.unlisted : (command) => command,
+  );
+
+const loadCommand = async (name: CommandName) => {
+  switch (name) {
+    case "provider":
+      return (await import("./commands/provider.ts")).providerCommand;
+    case "deploy":
+      return (await import("./commands/deploy.ts")).deployCommand;
+    case "dev":
+      return (await import("./commands/dev.ts")).devCommand;
+    case "destroy":
+      return (await import("./commands/deploy.ts")).destroyCommand;
+    case "plan":
+      return (await import("./commands/deploy.ts")).planCommand;
+    case "logs":
+      return (await import("./commands/logs.ts")).logsCommand;
+    case "profile":
+      return (await import("./commands/profile/index.ts")).profileCommand;
+    case "state":
+      return (await import("./commands/state.ts")).stateCommand;
+    case "drift":
+      return (await import("./commands/drift.ts")).driftCommand;
+    case "unsafe":
+      return (await import("./commands/nuke.ts")).unsafeCommand;
+  }
+};
+
+const argv = process.argv.slice(2);
+const requestedCommand = commandMetadata.find(([name]) =>
+  argv.includes(name),
+)?.[0];
+const loadEveryCommand = argv.includes("--completions");
+const commands = await Promise.all(
+  commandMetadata.map(([name, description]) =>
+    loadEveryCommand || name === requestedCommand
+      ? loadCommand(name)
+      : placeholderCommand(name, description),
+  ),
+);
 
 /**
  * `--no-input` forces plain, prompt-free output regardless of TTY or env
@@ -60,18 +107,7 @@ const root = Command.make("alchemy", {}, () =>
     { command: "alchemy dev" },
     { command: "alchemy logs --follow" },
   ]),
-  Command.withSubcommands([
-    providerCommand,
-    deployCommand,
-    devCommand,
-    destroyCommand,
-    planCommand,
-    logsCommand,
-    profileCommand,
-    stateCommand,
-    driftCommand,
-    unsafeCommand,
-  ]),
+  Command.withSubcommands([...commands]),
   Command.withGlobalFlags([NoInput]),
 );
 
