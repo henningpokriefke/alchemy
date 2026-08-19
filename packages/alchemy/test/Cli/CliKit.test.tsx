@@ -116,6 +116,7 @@ const makeLive = (
   return Effect.acquireRelease(
     Effect.sync(() => {
       const stdout = new CaptureStream(input);
+      const stderr = new CaptureStream(input);
       // Interactive runtimes need a raw-mode-capable stdin: with a real
       // process.stdin pipe Ink's useInput throws during commit, which now
       // surfaces as a renderer error instead of being silently swallowed.
@@ -127,6 +128,8 @@ const makeLive = (
           stdin: stdin as unknown as NodeJS.ReadStream | undefined,
           // SAFETY: CaptureStream implements the writable stream surface consumed by Ink.
           stdout: stdout as unknown as NodeJS.WriteStream,
+          // SAFETY: CaptureStream implements the writable stream surface consumed by Ink.
+          stderr: stderr as unknown as NodeJS.WriteStream,
           captureConsole: overrides.captureConsole ?? false,
         },
         {
@@ -137,7 +140,7 @@ const makeLive = (
           unicode: overrides.unicode ?? true,
         },
       );
-      return { ...runtime, stdout };
+      return { ...runtime, stdout, stderr };
     }),
     ({ dispose }) => Effect.promise(dispose),
   );
@@ -339,6 +342,33 @@ it.effect.each(orderingCases)("$name", ({ captureConsole, emit, verify }) =>
   }),
 );
 
+it.effect("commits stdio above active Ink views", () =>
+  Effect.gen(function* () {
+    const { service, stdout, stderr } = yield* makeLive({
+      captureConsole: true,
+    });
+    const store = new LiveStore("Resolving credentials");
+    const live = yield* service.live.open(<LiveLabel store={store} />, {
+      persistOnClose: true,
+    });
+
+    yield* Effect.sync(() => {
+      stdout.write("floci stdout\n");
+      stderr.write("node warning\n");
+      store.set("Credentials resolved");
+    });
+    yield* live.close;
+
+    expect(stdout.output).toContain("floci stdout");
+    expect(stdout.output).toContain("node warning");
+    expect(stderr.output).not.toContain("node warning");
+    expect(stdout.output).toContain("Credentials resolved");
+    expect(stdout.output.lastIndexOf("node warning")).toBeLessThan(
+      stdout.output.lastIndexOf("Credentials resolved"),
+    );
+  }),
+);
+
 it.effect("progress settles into success and failure status output", () =>
   Effect.gen(function* () {
     const { service, stdout } = makeStatic();
@@ -515,6 +545,25 @@ it.effect("shows the whole typed value while width remains available", () =>
     const result = yield* Fiber.join(fiber);
 
     expect(result).toBe("my-longer-profile-name");
+  }),
+);
+
+it.effect("shows a text prompt default before it is accepted", () =>
+  Effect.gen(function* () {
+    const stdin = new InputStream();
+    const { service, stdout } = yield* makeLive({ stdin });
+
+    const fiber = yield* service.prompt
+      .text({
+        message: "Emulator endpoint",
+        defaultValue: "http://localhost:4566",
+      })
+      .pipe(Effect.forkChild);
+    yield* Effect.promise(() => stdin.ready);
+    yield* Effect.promise(() => stdout.waitFor("http://localhost:4566"));
+    yield* Effect.sync(() => stdin.write("\r"));
+
+    expect(yield* Fiber.join(fiber)).toBe("http://localhost:4566");
   }),
 );
 

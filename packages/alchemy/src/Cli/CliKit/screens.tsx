@@ -191,7 +191,14 @@ function TextPrompt({ options, mask, submit, cancel }: TextPromptProps) {
       ]}
     >
       <TextField
-        placeholder={options.placeholder}
+        // A default is the value Enter will submit, so show it in the empty
+        // field when the caller did not supply more specific hint text.
+        // Keep it a placeholder (rather than initialValue) so the first
+        // keystroke starts a replacement instead of appending to the default.
+        placeholder={
+          options.placeholder ??
+          ("defaultValue" in options ? options.defaultValue : undefined)
+        }
         initialValue={
           "initialValue" in options ? options.initialValue : undefined
         }

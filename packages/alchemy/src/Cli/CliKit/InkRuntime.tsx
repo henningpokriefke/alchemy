@@ -15,6 +15,7 @@ import { LiveStore, useLiveStore } from "./components/Live.tsx";
 import { CancelledPrompt } from "./components/Transcript.tsx";
 import { Text } from "./components/Typography.tsx";
 import { NonInteractiveTerminal, TerminalCancelled } from "./errors.ts";
+import { patchConsole } from "./patchConsole.ts";
 import {
   confirmScreen,
   cycleSelectScreen,
@@ -335,6 +336,8 @@ export const makeRuntime = (
   let unmounting: Promise<void> | undefined;
   let applicationMounted = false;
   let disposed = false;
+  let restoreDirectStdio: (() => void) | undefined;
+  let flushDirectStdio: (() => void) | undefined;
   /**
    * Fails the active interaction when a screen component throws during
    * render. Without this the prompt's callback would never resume and the
@@ -347,19 +350,35 @@ export const makeRuntime = (
     // Ink keys instances by stdout and two live roots corrupt the output.
     while (unmounting !== undefined) await unmounting;
     if (disposed || mounted !== undefined) return;
+    const captureDirectStdio = options.captureConsole !== false;
+    const directStdoutWrite = stdout.write.bind(stdout);
+    const directStderrWrite = stderr.write.bind(stderr);
+    const inkStdout = captureDirectStdio
+      ? (Object.create(stdout) as NodeJS.WriteStream)
+      : stdout;
+    const inkStderr = captureDirectStdio
+      ? (Object.create(stderr) as NodeJS.WriteStream)
+      : stderr;
+    if (captureDirectStdio) {
+      inkStdout.write = directStdoutWrite;
+      inkStderr.write = directStderrWrite;
+    }
     const ink = render(
       <CliEnvironment capabilities={capabilities} observeWindow>
         <TerminalRoot store={store} />
       </CliEnvironment>,
       {
         stdin,
-        stdout,
-        stderr,
+        stdout: inkStdout,
+        stderr: inkStderr,
         exitOnCtrlC: false,
         interactive: capabilities.input,
         alternateScreen: alternateScreen,
         incrementalRendering: true,
-        patchConsole: options.captureConsole !== false,
+        // Console ultimately writes to stdout/stderr. Keep Ink's patch off so
+        // our stream capture below can put every kind of process output in
+        // the same Static region.
+        patchConsole: false,
       },
     );
     const current: Mounted = {
@@ -382,6 +401,57 @@ export const makeRuntime = (
       },
     );
     mounted = current;
+
+    // Process output lives in Ink's Static zone above every inline view.
+    // Adding a static row commits it to scrollback and naturally moves the
+    // live UI down, avoiding log-update's erase/restore path and its render
+    // artifacts. This covers console, Node warnings, and direct writes from
+    // tools such as Floci.
+    if (captureDirectStdio && restoreDirectStdio === undefined) {
+      const buffers = { stdout: "", stderr: "" };
+      const appendLines = (stream: keyof typeof buffers, data: string) => {
+        const parts = `${buffers[stream]}${data}`.split(/\r?\n/);
+        buffers[stream] = parts.pop() ?? "";
+        for (const line of parts)
+          store.appendStatic(<Text>{line || " "}</Text>);
+      };
+      const route = (
+        stream: keyof typeof buffers,
+        chunk: Uint8Array | string,
+        args: unknown[],
+      ) => {
+        const data =
+          typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+        appendLines(stream, data);
+        const callback = args.find(
+          (arg): arg is () => void => typeof arg === "function",
+        );
+        callback?.();
+        return true;
+      };
+      stdout.write = ((chunk: Uint8Array | string, ...args: unknown[]) =>
+        route("stdout", chunk, args)) as typeof stdout.write;
+      stderr.write = ((chunk: Uint8Array | string, ...args: unknown[]) =>
+        route("stderr", chunk, args)) as typeof stderr.write;
+      const restoreConsole = patchConsole((stream, data) =>
+        appendLines(stream, data),
+      );
+      flushDirectStdio = () => {
+        for (const stream of ["stdout", "stderr"] as const) {
+          if (buffers[stream] !== "") {
+            store.appendStatic(<Text>{buffers[stream]}</Text>);
+            buffers[stream] = "";
+          }
+        }
+      };
+      restoreDirectStdio = () => {
+        restoreConsole();
+        stdout.write = directStdoutWrite;
+        stderr.write = directStderrWrite;
+        restoreDirectStdio = undefined;
+        flushDirectStdio = undefined;
+      };
+    }
   };
 
   const ensureMounted = () => Effect.promise(() => mount());
@@ -402,6 +472,7 @@ export const makeRuntime = (
     if (current === undefined) return Promise.resolve();
     unmounting = (async () => {
       try {
+        flushDirectStdio?.();
         // Drain: keep flushing until no new static output arrives between
         // flushes, so a `print` racing the teardown reaches the terminal.
         let staticCount;
@@ -414,6 +485,7 @@ export const makeRuntime = (
         // teardown, so leave the instance mounted for them instead.
         if (!force && (applicationMounted || !store.idle)) return;
         mounted = undefined;
+        restoreDirectStdio?.();
         current.ink.unmount();
         await current.exit;
         current.ink.cleanup();
@@ -423,6 +495,7 @@ export const makeRuntime = (
       } catch {
         // Teardown must be total: a crashed instance still ends up unmounted.
         if (mounted === current) mounted = undefined;
+        restoreDirectStdio?.();
       }
     })().finally(() => {
       unmounting = undefined;
