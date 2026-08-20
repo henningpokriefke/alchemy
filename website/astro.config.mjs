@@ -355,7 +355,9 @@ export default defineConfig({
       filter: (page) =>
         !page.endsWith(".html") &&
         !page.endsWith(".md") &&
-        !page.endsWith(".mdx"),
+        !page.endsWith(".mdx") &&
+        // OAuth device-flow landing pages — `noindex` in `Auth.astro`.
+        !page.includes("/auth/"),
     }),
     starlight({
       title: "Alchemy",
