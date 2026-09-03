@@ -4,9 +4,12 @@ import * as Layer from "effect/Layer";
 import { Function } from "../../AWS/Lambda/Function.ts";
 import { Queue } from "../../AWS/SQS/Queue.ts";
 import { Parameter } from "../../AWS/SSM/Parameter.ts";
-import type { RunnerComputeSpec } from "../../AWS/EC2/RunnerCompute.ts";
+import {
+  resolveRunnerCompute,
+  type RunnerComputeProps,
+  type RunnerComputeSpec,
+} from "../../AWS/EC2/RunnerCompute.ts";
 import * as Namespace from "../../Namespace.ts";
-import * as Output from "../../Output.ts";
 import {
   ScalerDeployConfig,
   ScalerFunction,
@@ -16,24 +19,29 @@ import {
 import { Env, routeParameterName } from "./shared.ts";
 import type { RunnerControlPlane } from "./RunnerControlPlane.ts";
 
+export type { RunnerComputeProps, RunnerComputeSpec };
+
 export interface RunnerPoolProps {
   /**
    * The control plane this pool belongs to. Supplies the organization,
-   * the GitHub App credentials, and the shared SSM route prefix.
+   * the GitHub App credentials, and the shared conventions.
    */
   readonly controlPlane: RunnerControlPlane;
   /**
-   * Unique pool label and GitHub `runs-on` target (e.g.
-   * `alchemy-ci-4x`). Must match `^[a-zA-Z0-9_-]+$` — it becomes part of
-   * the SSM route path, the runner names, and the instance tags.
+   * Unique pool label and GitHub `runs-on` target (e.g. `my-team-ci`).
+   * Must match `^[a-zA-Z0-9_-]+$` — it becomes part of the SSM route
+   * path, the runner names, and the instance tags. Any shape works: team
+   * pools, size classes (`ci-4x`), or purpose pools (`release`).
    */
   readonly label: string;
   /**
-   * Compute backing this pool (see `AWS.EC2.RunnerCompute`). Spot vs.
-   * on-demand is purely a compute property — a release pool is an
-   * ordinary `RunnerPool` with an on-demand compute.
+   * Compute backing this pool as plain props — AMI, instance types,
+   * market, and networking. Spot vs. on-demand is purely a compute
+   * property: a release pool is an ordinary `RunnerPool` with an
+   * on-demand compute. The pool resolves launch template, networking,
+   * and instance IAM from these props at deploy time.
    */
-  readonly compute: RunnerComputeSpec;
+  readonly compute: RunnerComputeProps;
   /**
    * Maximum concurrent runner instances for this pool. Demand beyond the
    * limit stays queued in SQS and is retried after the visibility
@@ -70,18 +78,17 @@ const LABEL_PATTERN = /^[a-zA-Z0-9_-]+$/;
  * through the SSM route registry.
  *
  * ### CI Pool on Spot
- * **Example:** PR CI with price-optimized Spot capacity
+ * **Example:** Preemptible capacity for pull-request CI
  * ```typescript
- * const ci4x = yield* GitHub.Actions.RunnerPool("ci-4x", {
+ * const ci = yield* GitHub.Actions.RunnerPool("ci", {
  *   controlPlane: runners,
- *   label: "alchemy-ci-4x",
- *   compute: yield* AWS.EC2.RunnerCompute("ci-4x-compute", {
+ *   label: "my-team-ci",
+ *   compute: {
  *     market: "spot",
  *     instanceTypes: ["m8i.xlarge", "m7i.xlarge", "m7i-flex.xlarge", "m7a.xlarge"],
- *     allocationStrategy: "price-capacity-optimized",
  *     image: runnerAmi,
  *     network: { subnetIds: network.publicSubnetIds },
- *   }),
+ *   },
  *   maxRunners: 50,
  * });
  * ```
@@ -91,14 +98,31 @@ const LABEL_PATTERN = /^[a-zA-Z0-9_-]+$/;
  * ```typescript
  * const release = yield* GitHub.Actions.RunnerPool("release", {
  *   controlPlane: runners,
- *   label: "alchemy-release-4x",
- *   compute: yield* AWS.EC2.RunnerCompute("release-compute", {
+ *   label: "my-team-release",
+ *   compute: {
  *     market: "on-demand",
  *     instanceTypes: ["m8i.xlarge", "m7i.xlarge"],
  *     image: runnerAmi,
  *     network: { subnetIds: network.publicSubnetIds },
- *   }),
+ *   },
  *   maxRunners: 5,
+ * });
+ * ```
+ *
+ * ### Custom Image Layout
+ * **Example:** AMI with the agent outside the default directory
+ * ```typescript
+ * const legacy = yield* GitHub.Actions.RunnerPool("legacy", {
+ *   controlPlane: runners,
+ *   label: "legacy-ci",
+ *   compute: {
+ *     market: "spot",
+ *     instanceTypes: ["m7i.xlarge"],
+ *     image: legacyAmi,
+ *     runnerDir: "/usr/local/actions-runner",
+ *     network: { subnetIds: network.publicSubnetIds },
+ *   },
+ *   maxRunners: 10,
  * });
  * ```
  *
@@ -122,13 +146,12 @@ export const RunnerPool = (id: string, props: RunnerPoolProps) =>
           ),
         );
       }
-      if (props.compute.kind !== "aws-ec2") {
-        return yield* Effect.fail(
-          new Error(
-            `GitHub.Actions.RunnerPool supports only aws-ec2 compute in V1 (got ${(props.compute as { kind: string }).kind})`,
-          ),
-        );
-      }
+
+      const conventions = props.controlPlane.conventions;
+      const compute = yield* resolveRunnerCompute(props.compute, {
+        conventions,
+        fallbackPoolLabel: props.label,
+      });
 
       const deadLetter = yield* Queue("DemandDlq", {
         messageRetentionPeriod: "14 days",
@@ -142,16 +165,10 @@ export const RunnerPool = (id: string, props: RunnerPoolProps) =>
       });
 
       const route = yield* Parameter("Route", {
-        name: routeParameterName(
-          props.controlPlane.ssmRoutesPrefix,
-          props.label,
-        ),
+        name: routeParameterName(conventions.ssmRoutesPrefix, props.label),
         description: `Capacity-demand route for GitHub Actions pool ${props.label}`,
-        value: Output.all(demand.queueUrl, demand.queueArn).pipe(
-          Output.map(([queueUrl, queueArn]) =>
-            JSON.stringify({ queueUrl, queueArn }),
-          ),
-        ),
+        // Plain queue URL: the webhook and the reaper need nothing else.
+        value: demand.queueUrl,
       });
 
       const scaler = yield* ScalerFunction.pipe(
@@ -168,19 +185,19 @@ export const RunnerPool = (id: string, props: RunnerPoolProps) =>
                 [Env.installationId]: String(
                   props.controlPlane.githubApp.installationId,
                 ),
-                [Env.ssmRoutesPrefix]: props.controlPlane.ssmRoutesPrefix,
+                [Env.conventions]: JSON.stringify(conventions),
                 [Env.poolLabel]: props.label,
                 [Env.maxRunners]: String(props.maxRunners),
-                [Env.launchTemplateName]: props.compute.launchTemplateName,
-                [Env.subnetIds]: JSON.stringify(props.compute.subnetIds),
-                [Env.instanceTypes]: JSON.stringify(
-                  props.compute.instanceTypes,
-                ),
-                [Env.market]: props.compute.market,
+                [Env.launchTemplateName]: compute.launchTemplateName,
+                [Env.subnetIds]: JSON.stringify(compute.subnetIds),
+                [Env.instanceTypes]: JSON.stringify(compute.instanceTypes),
+                [Env.market]: compute.market,
               },
             },
             scalerImpl.pipe(
-              Effect.provide(Layer.succeed(ScalerDeployConfig, { demand })),
+              Effect.provide(
+                Layer.succeed(ScalerDeployConfig, { demand, conventions }),
+              ),
             ),
           ),
         ),
@@ -191,7 +208,7 @@ export const RunnerPool = (id: string, props: RunnerPoolProps) =>
         demand,
         route,
         scaler,
-        compute: props.compute,
+        compute,
         maxRunners: props.maxRunners,
         controlPlane: props.controlPlane,
       };

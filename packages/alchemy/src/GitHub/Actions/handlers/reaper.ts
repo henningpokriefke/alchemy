@@ -3,12 +3,10 @@ import * as sqs from "@distilled.cloud/aws/sqs";
 import * as ssm from "@distilled.cloud/aws/ssm";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import * as Result from "effect/Result";
 import * as Lambda from "../../../AWS/Lambda/Function.ts";
 import { Function } from "../../../AWS/Lambda/Function.ts";
 import { isScheduleEvent } from "../../../AWS/Scheduler/ScheduleEventSource.ts";
-import { optionalEnv, requiredEnv } from "../env.ts";
-import { decodeRouteValue } from "../routing.ts";
+import { optionalEnv, readConventions, requiredEnv } from "../env.ts";
 import {
   deleteOrgRunner,
   installationOctokit,
@@ -16,12 +14,7 @@ import {
   type GitHubAppCredentials,
   type OrgRunner,
 } from "../GitHubApp.ts";
-import {
-  Env,
-  MANAGED_TAG_KEY,
-  SSM_JIT_PREFIX,
-  SSM_ROUTES_PREFIX,
-} from "../shared.ts";
+import { Env, RunnerConventionsConfig, ssmParametersArn } from "../shared.ts";
 
 /**
  * Static entry for the shared reaper Lambda. Deploy it through
@@ -43,11 +36,11 @@ const tagValue = (
   key: string,
 ): string | undefined => tags?.find((tag) => tag.Key === key)?.Value;
 
-const listManagedInstances = () =>
+const listManagedInstances = (managedTagKey: string) =>
   ec2
     .describeInstances({
       Filters: [
-        { Name: `tag:${MANAGED_TAG_KEY}`, Values: ["true"] },
+        { Name: `tag:${managedTagKey}`, Values: ["true"] },
         {
           Name: "instance-state-name",
           Values: ["pending", "running", "stopping", "stopped"],
@@ -155,6 +148,11 @@ export const reaperImpl = Effect.gen(function* () {
   const host = yield* Lambda.Function;
 
   if (!globalThis.__ALCHEMY_RUNTIME__) {
+    // IAM derives from the same resolved conventions the runtime reads
+    // back from the environment, so custom prefixes and tag keys keep
+    // working — including the tag condition that bounds terminations to
+    // runner instances.
+    const { conventions } = yield* RunnerConventionsConfig;
     yield* host.bind`Allow(${host}, GitHub.Actions.ReaperCleanup)`({
       policyStatements: [
         {
@@ -170,14 +168,17 @@ export const reaperImpl = Effect.gen(function* () {
           Resource: ["*"],
           Condition: {
             StringEquals: {
-              [`aws:ResourceTag/${MANAGED_TAG_KEY}`]: "true",
+              [`aws:ResourceTag/${conventions.managedTagKey}`]: "true",
             },
           },
         },
         {
           Effect: "Allow",
           Action: ["ssm:GetParametersByPath", "ssm:DeleteParameter"],
-          Resource: ["arn:aws:ssm:*:*:parameter/alchemy/github-runners/*"],
+          Resource: [
+            ssmParametersArn(conventions.ssmRoutesPrefix),
+            ssmParametersArn(conventions.ssmJitPrefix),
+          ],
         },
         {
           Effect: "Allow",
@@ -213,9 +214,9 @@ const runReap = () =>
       ),
       installationId: Number(yield* requiredEnv("reaper", Env.installationId)),
     };
-    const routesPrefix =
-      (yield* optionalEnv(Env.ssmRoutesPrefix)) ?? SSM_ROUTES_PREFIX;
-    const jitPrefix = (yield* optionalEnv(Env.ssmJitPrefix)) ?? SSM_JIT_PREFIX;
+    const conventions = yield* readConventions();
+    const routesPrefix = conventions.ssmRoutesPrefix;
+    const jitPrefix = conventions.ssmJitPrefix;
     const startupDeadlineMinutes = Number(
       (yield* optionalEnv(Env.startupDeadlineMinutes)) ?? "10",
     );
@@ -225,7 +226,7 @@ const runReap = () =>
 
     const labels = yield* collectRouteLabels(routesPrefix);
     const labelSet = new Set(labels);
-    const instances = yield* listManagedInstances();
+    const instances = yield* listManagedInstances(conventions.managedTagKey);
     const liveNames = new Set(
       instances.flatMap((instance) => (instance.name ? [instance.name] : [])),
     );
@@ -298,20 +299,16 @@ const collectRouteLabels = (prefix: string) =>
     const labels: string[] = [];
     const parameters = yield* listParameters(prefix, "pool route");
     for (const parameter of parameters) {
-      if (!parameter.value) {
-        continue;
-      }
-      const decoded = yield* Effect.result(
-        decodeRouteValue(parameter.name, parameter.value),
-      );
-      if (Result.isFailure(decoded)) {
+      // Route values are plain queue URLs (see `RunnerPool`).
+      const queueUrl = parameter.value?.trim();
+      if (!queueUrl) {
         yield* Effect.logWarning(
-          `Removing corrupt pool route ${parameter.name}: ${decoded.failure.reason}`,
+          `Removing corrupt pool route ${parameter.name}: empty queue URL`,
         );
         yield* deleteSsmParameter(parameter.name);
         continue;
       }
-      if (!(yield* queueExists(decoded.success.queueUrl))) {
+      if (!(yield* queueExists(queueUrl))) {
         yield* Effect.log(
           `Removing stale pool route ${parameter.name} (queue gone)`,
         );

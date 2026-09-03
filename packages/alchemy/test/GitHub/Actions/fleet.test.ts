@@ -5,6 +5,7 @@ import {
   renderRunnerUserData,
   runnerTags,
 } from "@/GitHub/Actions/fleet.ts";
+import { DEFAULT_RUNNER_CONVENTIONS } from "@/GitHub/Actions/shared.ts";
 import { describe, expect, it } from "alchemy-test";
 
 describe("orderCandidates", () => {
@@ -93,7 +94,7 @@ describe("buildFleetRequest", () => {
 describe("runnerTags", () => {
   it("marks ownership, pool, job, and name", () => {
     expect(
-      runnerTags({
+      runnerTags(DEFAULT_RUNNER_CONVENTIONS, {
         poolLabel: "alchemy-ci-4x",
         runnerName: "gh-alchemy-ci-4x-42",
         jobKey: "octo/hello/42",
@@ -105,12 +106,35 @@ describe("runnerTags", () => {
       Name: "gh-alchemy-ci-4x-42",
     });
   });
+
+  it("follows custom tag keys", () => {
+    expect(
+      runnerTags(
+        {
+          managedTagKey: "platform-managed",
+          poolTagKey: "ci-pool",
+          jobTagKey: "ci-job",
+        },
+        {
+          poolLabel: "team-ci",
+          runnerName: "gh-team-ci-7",
+          jobKey: "octo/hello/7",
+        },
+      ),
+    ).toEqual({
+      "platform-managed": "true",
+      "ci-pool": "team-ci",
+      "ci-job": "octo/hello/7",
+      Name: "gh-team-ci-7",
+    });
+  });
 });
 
 describe("renderRunnerUserData", () => {
   it("embeds the JIT prefix and self-terminate flow", () => {
     const script = renderRunnerUserData({
       ssmJitPrefix: "/alchemy/github-runners/jit",
+      poolTagKey: "github-runner-pool",
       fallbackPoolLabel: "alchemy-ci-4x",
       fallbackRunnerName: "gh-x-1",
     });
@@ -120,8 +144,22 @@ describe("renderRunnerUserData", () => {
     expect(script).toContain("delete-parameter");
     expect(script).toContain("terminate-instances");
     expect(script).toContain("alchemy-ci-4x");
+    expect(script).toContain("/opt/actions-runner");
     // region is self-discovered via IMDS so the template stays portable
     expect(script).toContain("placement/region");
+  });
+
+  it("honors a custom agent directory and pool tag key", () => {
+    const script = renderRunnerUserData({
+      ssmJitPrefix: "/platform/ci/jit",
+      poolTagKey: "ci-pool",
+      runnerDir: "/usr/local/actions-runner",
+      fallbackPoolLabel: "team-ci",
+      fallbackRunnerName: "gh-team-ci-pending",
+    });
+    expect(script).toContain("/usr/local/actions-runner");
+    expect(script).toContain("/platform/ci/jit");
+    expect(script).toContain("ci-pool");
   });
 });
 

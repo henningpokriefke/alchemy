@@ -1,5 +1,5 @@
 import type * as ec2 from "@distilled.cloud/aws/ec2";
-import { JOB_TAG_KEY, MANAGED_TAG_KEY, POOL_TAG_KEY } from "./shared.ts";
+import { DEFAULT_RUNNER_DIR } from "./shared.ts";
 
 export type RunnerMarket = "spot" | "on-demand";
 
@@ -129,27 +129,52 @@ export interface RunnerInstanceTags {
 }
 
 /**
+ * Tag keys every runner instance (and its volumes) must carry, taken from
+ * the resolved conventions so custom tagging standards keep working.
+ */
+export interface RunnerTagKeys {
+  readonly managedTagKey: string;
+  readonly poolTagKey: string;
+  readonly jobTagKey: string;
+}
+
+/**
  * Tags every runner instance (and its volumes) must carry: the Alchemy
  * ownership marker (the reaper's safety boundary), the pool label, the
  * job key for GitHub correlation, and a `Name` for console readability.
+ * `RunnerConventions` satisfies `RunnerTagKeys` structurally, so callers
+ * pass the resolved conventions straight through.
  */
 export const runnerTags = (
+  keys: RunnerTagKeys,
   input: RunnerInstanceTags,
 ): Record<string, string> => ({
-  [MANAGED_TAG_KEY]: "true",
-  [POOL_TAG_KEY]: input.poolLabel,
-  [JOB_TAG_KEY]: input.jobKey,
+  [keys.managedTagKey]: "true",
+  [keys.poolTagKey]: input.poolLabel,
+  [keys.jobTagKey]: input.jobKey,
   Name: input.runnerName,
 });
 
 export interface RunnerUserDataInput {
   /**
    * SSM prefix holding per-job JIT parameters
-   * (`<SSM_JIT_PREFIX>/<runner-name>`). The instance derives its own
+   * (`<ssmJitPrefix>/<runner-name>`). The instance derives its own
    * parameter name from its `Name` tag, so the script stays static per
    * pool and works for every job.
    */
   readonly ssmJitPrefix: string;
+  /**
+   * Tag key carrying the pool label on runner instances. Taken from the
+   * resolved conventions so custom tagging standards keep working.
+   */
+  readonly poolTagKey: string;
+  /**
+   * Directory holding the GitHub Actions runner agent on the prepared
+   * AMI. Override it when the image lays the agent out elsewhere instead
+   * of replacing the whole script.
+   * @default "/opt/actions-runner"
+   */
+  readonly runnerDir?: string;
   readonly fallbackPoolLabel: string;
   readonly fallbackRunnerName: string;
 }
@@ -168,15 +193,18 @@ export interface RunnerUserDataInput {
  *    launch template, so `shutdown -h` would merely stop the instance).
  *
  * Requires a prepared AMI with the GitHub Actions runner agent
- * pre-installed at `/opt/actions-runner` and the AWS CLI (`aws`) on PATH.
+ * pre-installed (see `runnerDir`) and the AWS CLI (`aws`) on PATH. For
+ * fully custom images, skip this renderer and pass a complete script via
+ * the pool compute `userData` prop instead.
  */
 export const renderRunnerUserData = (
   input: RunnerUserDataInput,
 ): string => `#!/bin/bash
 set -euo pipefail
 
-RUNNER_DIR=/opt/actions-runner
+RUNNER_DIR=${JSON.stringify(input.runnerDir ?? DEFAULT_RUNNER_DIR)}
 JIT_PREFIX=${JSON.stringify(input.ssmJitPrefix)}
+POOL_TAG=${JSON.stringify(input.poolTagKey)}
 FALLBACK_POOL=${JSON.stringify(input.fallbackPoolLabel)}
 FALLBACK_NAME=${JSON.stringify(input.fallbackRunnerName)}
 
@@ -190,7 +218,7 @@ TAGS_TSV=$(aws ec2 describe-tags --region "$REGION" \\
   --query "Tags[].[Key,Value]" \\
   --output text)
 TAG_VALUE() { echo "$TAGS_TSV" | awk -v key="$1" '$1 == key {print $2}'; }
-EFFECTIVE_POOL=$(TAG_VALUE "github-runner-pool")
+EFFECTIVE_POOL=$(TAG_VALUE "$POOL_TAG")
 RUNNER_NAME=$(TAG_VALUE "Name")
 [ -z "$EFFECTIVE_POOL" ] && EFFECTIVE_POOL="$FALLBACK_POOL"
 [ -z "$RUNNER_NAME" ] && RUNNER_NAME="$FALLBACK_NAME"

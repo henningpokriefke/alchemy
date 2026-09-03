@@ -20,10 +20,15 @@ import * as Redacted from "effect/Redacted";
  * ```yaml
  * jobs:
  *   test:
- *     runs-on: alchemy-ci-4x
+ *     runs-on: my-team-ci
  *   release:
- *     runs-on: alchemy-release-4x
+ *     runs-on: my-team-release
  * ```
+ *
+ * Pools are plain composition: any label, instance family, or market works
+ * — teams with existing SSM hierarchies or tag standards pass
+ * `conventions` on the control plane, teams with custom images pass
+ * `runnerDir` / `userData` on the pool compute.
  */
 export default Alchemy.Stack(
   "GitHubRunnersExample",
@@ -43,10 +48,10 @@ export default Alchemy.Stack(
       repositories: ["my-org/api", "my-org/web"],
     });
 
-    const ci4x = yield* GitHub.Actions.RunnerPool("ci-4x", {
+    const ci = yield* GitHub.Actions.RunnerPool("ci", {
       controlPlane: runners,
-      label: "alchemy-ci-4x",
-      compute: yield* AWS.EC2.RunnerCompute("ci-4x-compute", {
+      label: "my-team-ci",
+      compute: {
         market: "spot",
         instanceTypes: [
           "m8i.xlarge",
@@ -54,32 +59,31 @@ export default Alchemy.Stack(
           "m7i-flex.xlarge",
           "m7a.xlarge",
         ],
-        allocationStrategy: "price-capacity-optimized",
         image: process.env.RUNNER_AMI!,
         network: {
           subnetIds: (process.env.RUNNER_SUBNET_IDS ?? "").split(","),
         },
-      }),
+      },
       maxRunners: 50,
     });
 
     const release = yield* GitHub.Actions.RunnerPool("release", {
       controlPlane: runners,
-      label: "alchemy-release-4x",
-      compute: yield* AWS.EC2.RunnerCompute("release-compute", {
+      label: "my-team-release",
+      compute: {
         market: "on-demand",
         instanceTypes: ["m8i.xlarge", "m7i.xlarge"],
         image: process.env.RUNNER_AMI!,
         network: {
           subnetIds: (process.env.RUNNER_SUBNET_IDS ?? "").split(","),
         },
-      }),
+      },
       maxRunners: 5,
     });
 
     return {
       webhookUrl: runners.webhookUrl,
-      ciPool: ci4x.label,
+      ciPool: ci.label,
       releasePool: release.label,
     };
   }),

@@ -1,5 +1,12 @@
 import * as Effect from "effect/Effect";
 import { unpackEnvValue } from "../../RuntimeContext.ts";
+import {
+  DEFAULT_RUNNER_CONVENTIONS,
+  Env,
+  resolveRunnerConventions,
+  type RunnerConventions,
+  type RunnerConventionsInput,
+} from "./shared.ts";
 
 /**
  * Runtime environment access for the runner control-plane Lambdas.
@@ -41,6 +48,26 @@ export const readJsonEnv = <T>(
       return Effect.succeed(JSON.parse(raw) as T);
     } catch {
       return Effect.fail(new Error(`Invalid JSON in env ${key}`));
+    }
+  });
+
+/**
+ * Read the resolved runner conventions deployed with this Lambda. Falls
+ * back to the defaults when the variable is absent (local testing);
+ * fails on corrupt JSON — a broken deployment should be loud, not
+ * silently unconfigured.
+ */
+export const readConventions = (): Effect.Effect<RunnerConventions, Error> =>
+  Effect.flatMap(readEnv(Env.conventions), (raw) => {
+    if (raw === undefined) {
+      return Effect.succeed(DEFAULT_RUNNER_CONVENTIONS);
+    }
+    try {
+      return Effect.succeed(
+        resolveRunnerConventions(JSON.parse(raw) as RunnerConventionsInput),
+      );
+    } catch {
+      return Effect.fail(new Error(`Invalid JSON in env ${Env.conventions}`));
     }
   });
 

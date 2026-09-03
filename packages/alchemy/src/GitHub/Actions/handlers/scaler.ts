@@ -10,7 +10,7 @@ import { Function } from "../../../AWS/Lambda/Function.ts";
 import { isSQSEvent } from "../../../AWS/Lambda/QueueEventSource.ts";
 import type { Queue } from "../../../AWS/SQS/Queue.ts";
 import * as Namespace from "../../../Namespace.ts";
-import { optionalEnv, readJsonEnv, requiredEnv } from "../env.ts";
+import { readConventions, readJsonEnv, requiredEnv } from "../env.ts";
 import {
   buildFleetRequest,
   decideScale,
@@ -26,10 +26,9 @@ import {
 } from "../GitHubApp.ts";
 import {
   Env,
-  JOB_TAG_KEY,
-  POOL_TAG_KEY,
-  SSM_JIT_PREFIX,
+  ssmParametersArn,
   type DemandMessage,
+  type RunnerConventions,
   jitParameterName,
   runnerNameFor,
 } from "../shared.ts";
@@ -44,19 +43,20 @@ export const main = import.meta.url;
 export class ScalerFunction extends Function<ScalerFunction>()("Scaler") {}
 
 /**
- * Deploy-only wiring: the demand queue object. The scaler impl consumes
- * it to create the event-source mapping and the SQS poll statements.
- * Provided by `RunnerPool` at deploy time; never touched at runtime
- * (the `__ALCHEMY_RUNTIME__` guard below), so Lambda execution never
- * needs it in context.
+ * Deploy-only wiring: the demand queue object plus the resolved
+ * conventions (for the JIT parameter IAM scope). Provided by
+ * `RunnerPool` at deploy time; never touched at runtime (the
+ * `__ALCHEMY_RUNTIME__` guard below), so Lambda execution never needs
+ * it in context.
  */
 export interface ScalerDeployConfig {
   readonly demand: Queue;
+  readonly conventions: RunnerConventions;
 }
 
 export const ScalerDeployConfig = Context.Service<
   ScalerDeployConfig,
-  { readonly demand: Queue }
+  { readonly demand: Queue; readonly conventions: RunnerConventions }
 >()("GitHub.Actions.ScalerDeployConfig");
 
 const parseDemand = (body: string): Effect.Effect<DemandMessage, Error> => {
@@ -105,11 +105,11 @@ const scalerCredentials = (): Effect.Effect<GitHubAppCredentials, Error> =>
     };
   });
 
-const liveInstanceCount = (poolLabel: string) =>
+const liveInstanceCount = (poolLabel: string, poolTagKey: string) =>
   ec2
     .describeInstances({
       Filters: [
-        { Name: `tag:${POOL_TAG_KEY}`, Values: [poolLabel] },
+        { Name: `tag:${poolTagKey}`, Values: [poolLabel] },
         {
           Name: "instance-state-name",
           Values: ["pending", "running"],
@@ -153,7 +153,7 @@ const handleDemand = (record: {
     const instanceTypes =
       (yield* readJsonEnv<readonly string[]>(Env.instanceTypes)) ?? [];
     const market = (yield* requiredEnv("scaler", Env.market)) as RunnerMarket;
-    const jitPrefix = (yield* optionalEnv(Env.ssmJitPrefix)) ?? SSM_JIT_PREFIX;
+    const conventions = yield* readConventions();
 
     const octokit = yield* installationOctokit(yield* scalerCredentials());
     const { status } = yield* getJobStatus(octokit, {
@@ -161,7 +161,7 @@ const handleDemand = (record: {
       repo: demand.repo,
       jobId: demand.jobId,
     });
-    const live = yield* liveInstanceCount(poolLabel);
+    const live = yield* liveInstanceCount(poolLabel, conventions.poolTagKey);
     const decision = decideScale({
       jobStatus: status,
       liveInstanceCount: live,
@@ -181,14 +181,18 @@ const handleDemand = (record: {
       );
     }
 
-    const runnerName = runnerNameFor(poolLabel, demand.jobId);
+    const runnerName = runnerNameFor(
+      poolLabel,
+      demand.jobId,
+      conventions.runnerNamePrefix,
+    );
     const jobKey = `${demand.owner}/${demand.repo}/${demand.jobId}`;
     const { encodedJitConfig } = yield* generateJitConfig(octokit, {
       org: organization,
       name: runnerName,
       labels: [poolLabel],
     });
-    const jitName = jitParameterName(jitPrefix, runnerName);
+    const jitName = jitParameterName(conventions.ssmJitPrefix, runnerName);
     yield* ssm
       .putParameter({
         Name: jitName,
@@ -196,8 +200,8 @@ const handleDemand = (record: {
         Type: "String",
         Overwrite: true,
         Tags: [
-          { Key: POOL_TAG_KEY, Value: poolLabel },
-          { Key: JOB_TAG_KEY, Value: jobKey },
+          { Key: conventions.poolTagKey, Value: poolLabel },
+          { Key: conventions.jobTagKey, Value: jobKey },
         ],
       })
       .pipe(
@@ -216,7 +220,7 @@ const handleDemand = (record: {
       launchTemplateName,
       candidates,
       market,
-      tags: runnerTags({ poolLabel, runnerName, jobKey }),
+      tags: runnerTags(conventions, { poolLabel, runnerName, jobKey }),
     });
     const result = yield* ec2
       .createFleet(fleet)
@@ -246,21 +250,30 @@ const handleDemand = (record: {
  * event-source mapping plus the fleet/SSM/SQS IAM statements; the runtime
  * half serves demand messages. All pool/compute/GitHub configuration
  * arrives via Lambda env (set by `RunnerPool` from resolved Outputs);
- * the only deploy-time object is the demand queue, injected through
- * `ScalerDeployConfig` behind the runtime guard.
+ * the only deploy-time objects are the demand queue and the resolved
+ * conventions, injected through `ScalerDeployConfig` behind the runtime
+ * guard.
  */
 export const scalerImpl = Effect.gen(function* () {
   const host = yield* Lambda.Function;
   let demand: Queue | undefined;
+  let conventions: RunnerConventions | undefined;
   if (globalThis.__ALCHEMY_RUNTIME__) {
     demand = undefined;
+    conventions = undefined;
   } else {
     const config = yield* ScalerDeployConfig;
     demand = config.demand;
+    conventions = config.conventions;
   }
 
-  if (!globalThis.__ALCHEMY_RUNTIME__ && demand !== undefined) {
+  if (
+    !globalThis.__ALCHEMY_RUNTIME__ &&
+    demand !== undefined &&
+    conventions !== undefined
+  ) {
     const queue = demand;
+    const jitArn = ssmParametersArn(conventions.ssmJitPrefix);
     yield* host.bind`Allow(${host}, GitHub.Actions.ScalerFleet)`({
       policyStatements: [
         {
@@ -286,7 +299,7 @@ export const scalerImpl = Effect.gen(function* () {
         {
           Effect: "Allow",
           Action: ["ssm:PutParameter"],
-          Resource: ["arn:aws:ssm:*:*:parameter/alchemy/github-runners/jit/*"],
+          Resource: [jitArn],
         },
         {
           Effect: "Allow",

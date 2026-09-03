@@ -1,5 +1,6 @@
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import { Function } from "../../AWS/Lambda/Function.ts";
 import { every } from "../../AWS/Scheduler/builders.ts";
@@ -7,12 +8,6 @@ import { Webhook } from "../Webhook.ts";
 import * as Namespace from "../../Namespace.ts";
 import * as Output from "../../Output.ts";
 import type { GitHubAppCredentials } from "./GitHubApp.ts";
-import {
-  RECOVERY_SCHEDULE,
-  RecoveryFunction,
-  main as recoveryMain,
-  recoveryImpl,
-} from "./handlers/recovery.ts";
 import {
   REAPER_SCHEDULE,
   ReaperFunction,
@@ -24,9 +19,13 @@ import {
   main as webhookMain,
   webhookImpl,
 } from "./handlers/webhook.ts";
-import { Env, SSM_ROUTES_PREFIX } from "./shared.ts";
-
-export type { GitHubAppCredentials };
+import {
+  Env,
+  RunnerConventionsConfig,
+  resolveRunnerConventions,
+  type RunnerConventions,
+  type RunnerConventionsInput,
+} from "./shared.ts";
 
 export interface RunnerControlPlaneRepository {
   /**
@@ -78,12 +77,12 @@ export interface RunnerControlPlaneProps {
    */
   readonly repositories?: ReadonlyArray<string | RunnerControlPlaneRepository>;
   /**
-   * SSM prefix for the pool route registry. Pools, webhook, and reaper
-   * must share it — only override it to run fully isolated fleets in one
-   * account.
-   * @default "/alchemy/github-runners/routes"
+   * Naming and tagging conventions shared by every pool and runner
+   * (SSM paths, EC2 tag keys, runner-name prefix). Unset fields fall
+   * back to the `DEFAULT_*` values, so most stacks omit this entirely
+   * and only teams with existing standards override it.
    */
-  readonly ssmRoutesPrefix?: string;
+  readonly conventions?: RunnerConventionsInput;
   /**
    * Reaper tuning.
    */
@@ -93,11 +92,10 @@ export interface RunnerControlPlaneProps {
 export interface RunnerControlPlaneResources {
   readonly organization: string;
   readonly githubApp: GitHubAppCredentials;
-  readonly ssmRoutesPrefix: string;
+  readonly conventions: RunnerConventions;
   readonly webhookUrl: Output.Output<string | undefined>;
   readonly webhookFunction: Function;
   readonly reaperFunction: Function;
-  readonly recoveryFunction: Function;
   readonly webhooks: readonly Webhook[];
 }
 
@@ -109,19 +107,23 @@ export type RunnerControlPlane = Effect.Success<
  * Serverless control plane for self-hosted GitHub Actions runners: one
  * per GitHub App / organization.
  *
- * Owns the webhook receiver (Lambda + Function URL), the shared reaper,
- * and the webhook recovery loop — plus optional repository webhooks.
- * It owns no EC2 configuration and makes no scheduling decisions:
- * GitHub stays the workflow engine, job queue, and job→runner scheduler,
- * while pools translate demand into fleet capacity.
+ * Owns the webhook receiver (Lambda + Function URL) and the shared
+ * reaper — plus optional repository webhooks. It owns no EC2
+ * configuration and makes no scheduling decisions: GitHub stays the
+ * workflow engine, job queue, and job→runner scheduler, while pools
+ * translate demand into fleet capacity.
+ *
+ * Demand that outlives a failed webhook stays queued in SQS and is
+ * retried after the visibility timeout; the reaper collects anything the
+ * happy path leaves behind. No recovery Lambda, no permanent listener.
  *
  * Pools register through the SSM route registry, so the control plane
  * never changes when pools come and go. Idle cost is effectively zero:
  * with no jobs there are no runner instances and the Lambdas only run
- * on delivery plus two short scheduler ticks.
+ * on delivery plus one short scheduler tick.
  *
  * ### Control Plane
- * **Example:** App, webhooks, and shared repair loops
+ * **Example:** App, webhooks, and the shared repair loop
  * ```typescript
  * const runners = yield* GitHub.Actions.RunnerControlPlane("runners", {
  *   organization: "my-org",
@@ -132,6 +134,22 @@ export type RunnerControlPlane = Effect.Success<
  *   },
  *   webhookSecret: Redacted.make(process.env.GITHUB_WEBHOOK_SECRET!),
  *   repositories: ["my-org/api", "my-org/web"],
+ * });
+ * ```
+ *
+ * ### Custom Conventions
+ * **Example:** Existing SSM hierarchy and tag standards
+ * ```typescript
+ * const runners = yield* GitHub.Actions.RunnerControlPlane("runners", {
+ *   organization: "my-org",
+ *   githubApp,
+ *   webhookSecret,
+ *   conventions: {
+ *     ssmRoutesPrefix: "/platform/ci/routes",
+ *     ssmJitPrefix: "/platform/ci/jit",
+ *     managedTagKey: "platform-managed",
+ *     poolTagKey: "ci-pool",
+ *   },
  * });
  * ```
  *
@@ -152,7 +170,10 @@ export const RunnerControlPlane = (
         );
       }
 
-      const ssmRoutesPrefix = props.ssmRoutesPrefix ?? SSM_ROUTES_PREFIX;
+      const conventions = resolveRunnerConventions(props.conventions);
+      const conventionsLayer = Layer.succeed(RunnerConventionsConfig, {
+        conventions,
+      });
       const repositories = (props.repositories ?? []).map(normalizeRepository);
 
       const webhookFunction = yield* WebhookFunction.pipe(
@@ -165,10 +186,10 @@ export const RunnerControlPlane = (
               timeout: Duration.seconds(30),
               env: {
                 [Env.webhookSecret]: props.webhookSecret,
-                [Env.ssmRoutesPrefix]: ssmRoutesPrefix,
+                [Env.conventions]: JSON.stringify(conventions),
               },
             },
-            webhookImpl,
+            webhookImpl.pipe(Effect.provide(conventionsLayer)),
           ),
         ),
       );
@@ -185,7 +206,7 @@ export const RunnerControlPlane = (
                 [Env.appId]: props.githubApp.appId,
                 [Env.appPrivateKey]: props.githubApp.privateKey,
                 [Env.installationId]: String(props.githubApp.installationId),
-                [Env.ssmRoutesPrefix]: ssmRoutesPrefix,
+                [Env.conventions]: JSON.stringify(conventions),
                 [Env.startupDeadlineMinutes]: String(
                   props.reaper?.startupDeadlineMinutes ?? 10,
                 ),
@@ -194,7 +215,7 @@ export const RunnerControlPlane = (
                 ),
               },
             },
-            reaperImpl,
+            reaperImpl.pipe(Effect.provide(conventionsLayer)),
           ),
         ),
       );
@@ -228,50 +249,13 @@ export const RunnerControlPlane = (
         webhooks.push(webhook);
       }
 
-      const hookIds: number[] = [];
-      for (const webhook of webhooks) {
-        // Yielding an Output resolves to an Accessor; yielding the
-        // accessor resolves the value (same double-yield as the Lambda
-        // SQS fixtures).
-        const hookIdAccessor = yield* webhook.webhookId;
-        const hookId = yield* hookIdAccessor;
-        hookIds.push(hookId);
-      }
-
-      const recoveryFunction = yield* RecoveryFunction.pipe(
-        Effect.provide(
-          RecoveryFunction.make(
-            {
-              main: recoveryMain,
-              memorySize: 256,
-              timeout: Duration.minutes(5),
-              env: {
-                [Env.appId]: props.githubApp.appId,
-                [Env.appPrivateKey]: props.githubApp.privateKey,
-                [Env.installationId]: String(props.githubApp.installationId),
-                [Env.recoveryWebhooks]: JSON.stringify(
-                  hookIds.map((hookId, index) => ({
-                    owner: repositories[index].owner,
-                    repo: repositories[index].repository,
-                    hookId,
-                  })),
-                ),
-              },
-            },
-            recoveryImpl,
-          ),
-        ),
-      );
-      yield* every(RECOVERY_SCHEDULE).toLambda(recoveryFunction);
-
       const resources: RunnerControlPlaneResources = {
         organization: props.organization,
         githubApp: props.githubApp,
-        ssmRoutesPrefix,
+        conventions,
         webhookUrl: webhookFunction.functionUrl,
         webhookFunction,
         reaperFunction,
-        recoveryFunction,
         webhooks,
       };
       return resources;

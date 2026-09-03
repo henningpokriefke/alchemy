@@ -1,13 +1,17 @@
 import * as sqs from "@distilled.cloud/aws/sqs";
 import * as ssm from "@distilled.cloud/aws/ssm";
 import * as Effect from "effect/Effect";
-import * as Result from "effect/Result";
 import * as Lambda from "../../../AWS/Lambda/Function.ts";
 import { Function } from "../../../AWS/Lambda/Function.ts";
 import { verifyWebhookSignature } from "../crypto.ts";
-import { optionalEnv, readEnv } from "../env.ts";
-import { decodeRouteValue, routePoolLabels } from "../routing.ts";
-import { Env, SSM_ROUTES_PREFIX, type DemandMessage } from "../shared.ts";
+import { readConventions, readEnv } from "../env.ts";
+import { routePoolLabels } from "../routing.ts";
+import {
+  Env,
+  RunnerConventionsConfig,
+  ssmParametersArn,
+  type DemandMessage,
+} from "../shared.ts";
 
 /**
  * Static entry for the webhook receiver Lambda. Deploy it through
@@ -81,22 +85,20 @@ const listRoutes = (prefix: string) =>
           ),
         );
       for (const parameter of page.Parameters ?? []) {
+        // Route values are plain queue URLs (see `RunnerPool`). Skip
+        // corrupt entries without breaking fan-out to healthy pools.
         const value =
-          typeof parameter.Value === "string" ? parameter.Value : undefined;
+          typeof parameter.Value === "string" ? parameter.Value.trim() : "";
         if (!parameter.Name || !value) {
+          if (parameter.Name) {
+            yield* Effect.logWarning(
+              `Skipping pool route ${parameter.Name}: empty queue URL`,
+            );
+          }
           continue;
         }
         const label = parameter.Name.slice(prefix.length + 1);
-        const decoded = yield* Effect.result(
-          decodeRouteValue(parameter.Name, value),
-        );
-        if (Result.isFailure(decoded)) {
-          yield* Effect.logWarning(
-            `Skipping corrupt pool route ${parameter.Name}: ${decoded.failure.reason}`,
-          );
-          continue;
-        }
-        routes.set(label, { queueUrl: decoded.success.queueUrl });
+        routes.set(label, { queueUrl: value });
       }
       nextToken = page.NextToken;
     } while (nextToken);
@@ -138,9 +140,8 @@ const handleDelivery = (
       return { statusCode: 202, body: { ignored: true } };
     }
 
-    const prefix =
-      (yield* optionalEnv(Env.ssmRoutesPrefix)) ?? SSM_ROUTES_PREFIX;
-    const routes = yield* listRoutes(prefix);
+    const conventions = yield* readConventions();
+    const routes = yield* listRoutes(conventions.ssmRoutesPrefix);
     const matched = routePoolLabels(payload.workflow_job.labels, [
       ...routes.keys(),
     ]);
@@ -184,14 +185,15 @@ export const webhookImpl = Effect.gen(function* () {
   const host = yield* Lambda.Function;
 
   if (!globalThis.__ALCHEMY_RUNTIME__) {
+    // IAM derives from the same resolved conventions the runtime reads
+    // back from the environment, so custom prefixes keep working.
+    const { conventions } = yield* RunnerConventionsConfig;
     yield* host.bind`Allow(${host}, GitHub.Actions.WebhookFanOut)`({
       policyStatements: [
         {
           Effect: "Allow",
           Action: ["ssm:GetParametersByPath"],
-          Resource: [
-            "arn:aws:ssm:*:*:parameter/alchemy/github-runners/routes/*",
-          ],
+          Resource: [ssmParametersArn(conventions.ssmRoutesPrefix)],
         },
         {
           // Demand targets are discovered at runtime via the route
