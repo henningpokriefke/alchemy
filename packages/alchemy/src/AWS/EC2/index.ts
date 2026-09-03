@@ -36,6 +36,7 @@ export * from "./RevokeSecurityGroupIngressHttp.ts";
 export * from "./Route.ts";
 export * from "./RouteTable.ts";
 export * from "./RouteTableAssociation.ts";
+export * from "./RunnerCompute.ts";
 export * from "./SecurityGroup.ts";
 export * from "./SecurityGroupRule.ts";
 export * from "./Snapshot.ts";
